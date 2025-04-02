@@ -146,6 +146,68 @@ class GPT(nn.Module):
 
         return model
 
+    def forward(self, idx):
+        B, T = idx.size()
+        assert T <= self.config.block_size, f"can not forward sequence of length {T}, block size is only {self.config.block_size}"
+
+        # forward the token embeddings and position embeddings
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)  # shape (T)
+        tok_emb = self.transformer.wte(idx)  # (B, T, n_embd)
+        pos_emb = self.transformer.wpe(pos)  # (T, n_embd)
+        x = tok_emb + pos_emb
+
+        # forward the blocks of the transformer
+        for block in self.transformer.h:
+            x = block(x)
+        
+        # forward the final layer norm and classifier
+        x = self.transformer.ln_f(x)  # (B, T, n_embd)
+        logits = self.lm_head(x)  # (B, T, vocab_size)
+        return logits
+
+
+num_return_sequences = 5
+max_length = 30
 
 model = GPT.from_pretrained("gpt2")
-print('did not crash, yay!')
+model.eval()
+# model.to("cuda")
+
+# prefix tokens
+import tiktoken
+enc = tiktoken.get_encoding("gpt2")
+tokens = enc.encode("Hello, I'm a language model.")
+tokens = torch.tensor(tokens, dtype=torch.long)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+x = tokens
+# x = tokens.to('cuda')
+
+
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+# right now x is (5, 8) where B=5 and T=8
+
+while x.size(1) < max_length:
+    # forward the model to get the logits
+    with torch.no_grad():
+        logits = model(x)  # (B, T, vocab_size)
+        # take the logits at the last position
+        logits = logits[:, -1, :]    # (B, vocab_size)
+        # get the probabilities
+        probs = F.softmax(logits, dim=-1)
+        # do top-k sampling of 50 (huggingface pipeline default)
+        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # select a token from the top-k probabilities
+        ix = torch.multinomial(topk_probs, 1)  # (B, 1)
+        # gather the corresponding indices 
+        xcol = torch.gather(topk_indices, -1, ix)  # (B, 1)
+        # append to the sequence
+        x = torch.cat((x, xcol), dim=1)
+
+
+# print the generated text
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(f"> {decoded}")
