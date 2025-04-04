@@ -146,7 +146,7 @@ class GPT(nn.Module):
 
         return model
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, f"can not forward sequence of length {T}, block size is only {self.config.block_size}"
 
@@ -163,24 +163,50 @@ class GPT(nn.Module):
         # forward the final layer norm and classifier
         x = self.transformer.ln_f(x)  # (B, T, n_embd)
         logits = self.lm_head(x)  # (B, T, vocab_size)
-        return logits
-
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
+ 
 
 num_return_sequences = 5
 max_length = 30
 
-model = GPT.from_pretrained("gpt2")
-model.eval()
-# model.to("cuda")
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+
+print(f"Your device is: {device}")
 
 # prefix tokens
 import tiktoken
 enc = tiktoken.get_encoding("gpt2")
-tokens = enc.encode("Hello, I'm a language model.")
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-x = tokens
-# x = tokens.to('cuda')
+with open('dataset/input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)
+B, T = 4, 32
+buff = torch.tensor(tokens[:B*T + 1])
+x = buff[:-1].view(B, T)
+y = buff[1:].view(B, T)
+x = x.to(device)
+y = y.to(device)
+
+
+model = GPT(GPTConfig)
+model.to(device)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss {loss.item()}")
+
+import sys; sys.exit(0)
 
 
 torch.manual_seed(42)
