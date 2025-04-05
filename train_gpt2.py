@@ -55,7 +55,7 @@ class CausalSelfAttention(nn.Module):
         # output projection
         y = self.c_proj(y)
         return y
-        
+       
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -235,6 +235,8 @@ device = "cpu"
 
 model = GPT(GPTConfig())
 model.to(device)
+model = torch.compile(model)
+
 train_loader = DataLoaderLite(B=4, T=32)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
