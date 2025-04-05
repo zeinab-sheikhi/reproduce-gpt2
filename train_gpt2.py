@@ -6,6 +6,7 @@ import tiktoken
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import torch.optim.adamw
 
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
@@ -195,7 +196,37 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
-
+    
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all of the candidate parameters (that requires grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layer norms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nondecay_params = [p for n, p in param_dict() if p.dim() < 2]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params ": nondecay_params, "weight_decay": 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nondecay_params = sum(p.numel() for p in nondecay_params)
+        print(f"num decay parameters tensors: {len(decay_params)} with {num_decay_params:,} parameters")
+        print(f"num nondecay parameters tensors: {len(nondecay_params)} with {num_nondecay_params:,} parameters")
+        # create the Adam optimizer and use the fuse version if available
+        fused_available = 'fused' in inspect.signature(torch.optim.Adamw).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(
+            optim_groups,
+            lr=learning_rate,
+            betas=[0.9, 0.95],
+            eps=1e-8,
+            fused=use_fused,
+            weight_decay=weight_decay,
+        )
+        return optimizer
+        
 
 class DataLoaderLite:
     def __init__(self, B, T):
@@ -263,7 +294,8 @@ def get_lr(it):
 
 
 train_loader = DataLoaderLite(B=4, T=32)
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=[0.9, 0.95], eps=1e-8)
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=[0.9, 0.95], eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
 
 for step in range(max_steps):
