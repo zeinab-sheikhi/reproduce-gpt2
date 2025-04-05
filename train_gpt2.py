@@ -47,10 +47,14 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
 
         # attention materializes the large (T, T) matrix for all queries and keys
-        att = q @ k.transpose(-2, -1) * (1 / math.sqrt(k.size(-1))) 
-        att = att.masked_fill(self.bias[:,:,:T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # att = q @ k.transpose(-2, -1) * (1 / math.sqrt(k.size(-1))) 
+        # att = att.masked_fill(self.bias[:,:,:T, :T] == 0, float("-inf"))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # utilize Flash Attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # reassemble all heads outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -121,7 +125,7 @@ class GPT(nn.Module):
     def from_pretrained(cls, model_type):
         """Load pretrained GPT2 model weights from HuggingFace."""
         assert model_type in ["gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"]
-        
+       
         from transformers import GPT2LMHeadModel
         print(f"Loading weights from pretrained gpt: {model_type}")
 
@@ -145,7 +149,7 @@ class GPT(nn.Module):
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
-        
+       
         # copy while making sure all of the parameters are aligned and match in names and shapes
         sd_keys_hf = sd_hf.keys()
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith(".attn.masked_bias")]  # ignore these, just a buffer
