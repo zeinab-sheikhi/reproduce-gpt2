@@ -27,6 +27,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_emb, 3 * config.n_emb)
         # output projection
         self.c_proj = nn.Linear(config.n_emb, config.n_emb)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         # regularization 
         self.n_head = config.n_head
         self.n_emb = config.n_emb
@@ -62,6 +63,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_emb, 4 * config.n_emb)
         self.gelu = nn.GELU(approximate="tanh")
         self.c_proj = nn.Linear(config.n_emb * 4, config.n_emb)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
    
     def forward(self, x):
         x = self.c_fc(x)
@@ -97,7 +99,24 @@ class GPT(nn.Module):
             )
         )
         self.lm_head = nn.Linear(self.config.n_emb, self.config.vocab_size, bias=False)
-      
+    
+        # weight sharing scheme; the resulting tensor is gonna be used twice in forward pass, and will add up two branches in the backward pass
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        std = 0.02
+        if hasattr(module, "NANOGPT_SCALE_INIT"):
+            std *= (2 * self.config.n_layer) ** -0.5  # in each transformer block we have two residual path
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     @classmethod
     def from_pretrained(cls, model_type):
         """Load pretrained GPT2 model weights from HuggingFace."""
@@ -223,7 +242,8 @@ for i in range(50):
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
     print(f"step {i}, loss {loss.item()}")
