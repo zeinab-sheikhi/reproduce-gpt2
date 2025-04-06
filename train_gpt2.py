@@ -244,18 +244,18 @@ class DataLoaderLite:
         print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
         # state
-        self.current_positin = self.B * self.T * self.process_rank
+        self.current_position = self.B * self.T * self.process_rank
     
     def next_batch(self):
         B, T, num_proc = self.B, self.T, self.num_processes
-        buf = self.tokens[self.current_positin: self.current_positin + (B * T) + 1]
+        buf = self.tokens[self.current_position: self.current_position + (B * T) + 1]
         x = (buf[:-1]).view(B, T)  # inputs
         y = (buf[1:]).view(B, T)
         # advance the position in the tensor
-        self.current_positin += B * T * num_proc
+        self.current_position += B * T * num_proc
         # if loading next batch would be out of bounds, reset
-        if self.current_positin + (B * T * num_proc + 1) > len(self.tokens):
-            self.current_positin = B * T * num_proc
+        if self.current_position + (B * T * num_proc + 1) > len(self.tokens):
+            self.current_position = B * T * num_proc
 
         return x, y
 
