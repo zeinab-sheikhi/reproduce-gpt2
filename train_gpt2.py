@@ -4,6 +4,7 @@ import os
 import time
 from dataclasses import dataclass
 
+import numpy as np
 import tiktoken
 import torch
 import torch.nn as nn
@@ -11,6 +12,14 @@ import torch.distributed as dist
 from torch.nn import functional as F
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+from fineweb import load_tokens
+
+# simple launch
+# python train_gpt2.py 
+# DDP launch for e.g. 8 GPUs
+# torchrun --standalone --nproc_per_node=8 train_gpt2.py
+
 
 @dataclass
 class GPTConfig:
@@ -226,36 +235,55 @@ class GPT(nn.Module):
         return optimizer
         
 
+def load_tokens(filename):
+    npt = np.load(filename)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+
+
 # We want each process to get its own chunk of data to avoid each of them running the same data
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        assert split in {"train", "val"}
 
-        # at init load tokens from disk and save them in memory 
-        with open('dataset/input.txt', 'r') as f:
-            text = f.read()
-        enc = tiktoken.get_encoding("gpt2")
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"Loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
-
-        # state
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for {split}"
+        if master_process:
+            print(f"Found {len(shards)} shards for split {split}")
+        
+        # state, init at the shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
-    
+
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank
+        
     def next_batch(self):
-        B, T, num_proc = self.B, self.T, self.num_processes
+        B, T = self.B, self.T
         buf = self.tokens[self.current_position: self.current_position + (B * T) + 1]
         x = (buf[:-1]).view(B, T)  # inputs
         y = (buf[1:]).view(B, T)
         # advance the position in the tensor
-        self.current_position += B * T * num_proc
+        self.current_position += B * T * self.num_processes
         # if loading next batch would be out of bounds, reset
-        if self.current_position + (B * T * num_proc + 1) > len(self.tokens):
-            self.current_position = B * T * num_proc
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank
 
         return x, y
 
@@ -303,8 +331,8 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=4, T=32, process_rank=ddp_rank, num_processes=ddp_world_size)
-
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 torch.set_float32_matmul_precision("high")
 
 # create model 
@@ -319,8 +347,12 @@ raw_model = model.module if ddp else model
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 715
+max_steps = 19073
+
+# where did those numbers come from?
+# we are doing 2**19 tokens per step, we have 10e9 tokens , so 10e9 / 2**19=19073 steps
+# in GPT3 paper, it is said that warm up over 375 million tokens, so 375e6/2**19=715
 
 
 def get_lr(it):
@@ -342,6 +374,27 @@ optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4,
 
 for step in range(max_steps):
     t0 = time.time()
+
+    if step % 100 == 0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(dtype=torch.long, device_type=device):
+                    logits, loss = model(x)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+
+    # training loop
+    model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
@@ -374,32 +427,7 @@ for step in range(max_steps):
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_second = tokens_processed / dt
     if master_process:
-        print(f"step {step} | loss {loss_accum.item()} | lr: {lr:.4f} | norm: {norm:.4f} | dt: {dt:.4f}")
+        print(f"step {step} | loss {loss_accum.item()} | lr: {lr:.4f} | norm: {norm:.4f} | dt: {dt:.4f} | tok/sec: {tokens_per_second}")
 
 if ddp:
     destroy_process_group()
-
-# while x.size(1) < max_length:
-#     # forward the model to get the logits
-#     with torch.no_grad():
-#         logits = model(x)  # (B, T, vocab_size)
-#         # take the logits at the last position
-#         logits = logits[:, -1, :]    # (B, vocab_size)
-#         # get the probabilities
-#         probs = F.softmax(logits, dim=-1)
-#         # do top-k sampling of 50 (huggingface pipeline default)
-#         # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-#         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-#         # select a token from the top-k probabilities
-#         ix = torch.multinomial(topk_probs, 1)  # (B, 1)
-#         # gather the corresponding indices 
-#         xcol = torch.gather(topk_indices, -1, ix)  # (B, 1)
-#         # append to the sequence
-#         x = torch.cat((x, xcol), dim=1)
-
-
-# # print the generated text
-# for i in range(num_return_sequences):
-#     tokens = x[i, :max_length].tolist()
-#     decoded = enc.decode(tokens)
-#     print(f"> {decoded}")
