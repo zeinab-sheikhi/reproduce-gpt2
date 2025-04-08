@@ -260,10 +260,6 @@ class DataLoaderLite:
         return x, y
 
 
-num_return_sequences = 5
-max_length = 30
-
-
 # Set up DistributeDataParallel
 # -----------------------------------------------------------------------
 # They are gonna be 8 processes in parallel, if we have 8 GPUs, 
