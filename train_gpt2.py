@@ -4,20 +4,26 @@ import os
 import time
 from dataclasses import dataclass
 
-import numpy as np
+import tiktoken
 import torch
-import torch.nn as nn
 import torch.distributed as dist
+import torch.nn as nn
+from torch.distributed import destroy_process_group
+from torch.distributed import init_process_group
 from torch.nn import functional as F
-from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from fineweb import load_tokens
+from hellaswag import get_most_likely_norm
+from hellaswag import iterate_examples
+from hellaswag import render_example
 
 # simple launch
 # python train_gpt2.py 
 # DDP launch for e.g. 8 GPUs
 # torchrun --standalone --nproc_per_node=8 train_gpt2.py
+
+enc = tiktoken.get_encoding("gpt2")
 
 
 @dataclass
@@ -183,7 +189,7 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         B, T = idx.size()
-        assert T <= self.config.block_size, f"can not forward sequence of length {T}, block size is only {self.config.block_size}"
+        assert self.config.block_size >= T, f"can not forward sequence of length {T}, block size is only {self.config.block_size}"
 
         # forward the token embeddings and position embeddings
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)  # shape (T)
@@ -331,7 +337,10 @@ torch.set_float32_matmul_precision("high")
 # create model 
 model = GPT(GPTConfig(vocab_size=50304))  # we have preferences for numbers which are power of two!
 model.to(device)
-model = torch.compile(model)
+use_compile = False  # torch.compile() intereferes with HellaSwag eval and model generation, TODO: you should check it with newwer version of Pytorch you have
+if use_compile:
+    model = torch.compile(model)
+
 if ddp:
     # once we do the backward pass on each 8 identical GPUs, each of them has gradients
     # What DDP does is averaging cross all ranks of their gradients, and deposit that average on every single rank 
@@ -341,7 +350,7 @@ raw_model = model.module if ddp else model
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
-max_steps = 19073
+max_steps = 19073 * 4  # run over 4 epochs
 
 # where did those numbers come from?
 # we are doing 2**19 tokens per step, we have 10e9 tokens , so 10e9 / 2**19=19073 steps
@@ -364,11 +373,20 @@ def get_lr(it):
 
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
+# create log directory, we will write logs and checkpoints to this directory
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, "log.txt")
+with open(log_file, "w") as f:  # open for writing to clear the file
+    pass
+
 
 for step in range(max_steps):
     t0 = time.time()
+    last_step = step == max_steps - 1
 
-    if step % 100 == 0:
+    # Every once in a while evaluate our validation loss
+    if step % 200 == 0 or last_step:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
@@ -385,6 +403,88 @@ for step in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+            if step > 0 and (step % 5000 == 0 or last_step):
+                # optionally write model checkpoints
+                checkpoint_path = os.path.join(log_dir, f"checkpoint_{step:05d}.pt")
+                checkpoint = {
+                    "model": raw_model.state_dict(), 
+                    "config": raw_model.config,
+                    "step": step, 
+                    "val_loss": val_loss_accum.item(),
+                }
+                torch.save(checkpoint, checkpoint_path)
+                print(f"wrote checkpoint to {checkpoint_path}")
+
+    # Once in a while evaluate Hellaswag
+    if (step % 250 == 0 or last_step) and (not use_compile):
+        num_correct_norm = 0
+        num_total = 0 
+        for i, example in enumerate(iterate_examples("val")):
+            # only process examples where i % ddp_world_size == ddp_rank
+            if i % ddp_world_size != ddp_rank:
+                continue
+            # render the example into tokens and label
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            # get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(tokens)
+                pred_norm = get_most_likely_norm(tokens, mask, logits)
+            num_total += 1
+            num_correct_norm += int(pred_norm == label)
+        # reduce the stats across all processes
+        if ddp:
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        acc_norm = num_correct_norm / num_total
+        if master_process:
+            print(f"hellaswag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} hella {acc_norm:.4f}\n")
+            
+    # once in a while generate from the model (except step 0, which is noise)
+    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
+        model.eval()
+        num_return_sequences = 4
+        max_length = 32
+        tokens = enc.encoded("Hello, I'm a language model,")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        xgen = tokens.to(device)
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42 + ddp_rank)
+        while xgen.size(1) < max_length:
+            # forward the model to get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(xgen)
+                # take the logits at the last position
+                logits = logits[:, -1, :]  # (B, vocab_size)
+                # get the probabilities
+                probs = F.softmax(logits, dim=-1)
+                # do top-k sampling of 50 
+                # topk_probs becomes (5, 50) and topk_indices becomes (5, 50)
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                # select a token from the top-k probabilities
+                # note: multinomial does not demand the input to sum to 1
+                ix = torch.multinomial(topk_probs, num_samples=1)
+                # gather the corresponding indices
+                ix = torch.gather(topk_indices, dim=-1, index=ix)
+                # append the selected token to the running sequence
+                xgen = torch.cat((xgen, ix), dim=1)
+        # print the generated text
+        for i in range(num_return_sequences):
+            tokens = xgen[i, :max_length].tolist()
+            decoded = enc.decode(tokens)
+            print(f"rank {ddp_rank} sample {i}: {decoded}")
 
     # training loop
     model.train()
@@ -414,13 +514,16 @@ for step in range(max_steps):
         param_group['lr'] = lr 
 
     optimizer.step()
-    # torch.cuda.synchronize()
+    torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0  # time difference in seconds
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_second = tokens_processed / dt
     if master_process:
         print(f"step {step} | loss {loss_accum.item()} | lr: {lr:.4f} | norm: {norm:.4f} | dt: {dt:.4f} | tok/sec: {tokens_per_second}")
+        with open("log_file", "a") as f:
+            f.write(f"{step} train {loss_accum.item():.6f}\n")
+
 
 if ddp:
     destroy_process_group()

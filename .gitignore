@@ -1,5 +1,5 @@
 .venv/
-test.py
-test.ipynb
+notebooks/
 dataset/
-edu_fineweb10B/
+.ruff_cache/
+.mypy_cache/

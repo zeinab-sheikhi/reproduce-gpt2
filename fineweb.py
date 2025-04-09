@@ -7,12 +7,12 @@ $ python fineweb.py
 Will save shards to the local directory "edu_fineweb10B".
 """
 
-import os
 import multiprocessing as mp
+import os
+from multiprocessing import freeze_support
+
 import numpy as np
 import tiktoken
-
-from multiprocessing import freeze_support
 from datasets import load_dataset
 from tqdm import tqdm
 
@@ -36,7 +36,7 @@ def tokenize(doc):
     tokens = [eot] # the special <|endoftext|> token delimits all documents
     tokens.extend(enc.encode_ordinary(doc["text"]))
     tokens_np = np.array(tokens)
-    assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
+    assert (tokens_np >= 0).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
     tokens_np_uint16 = tokens_np.astype(np.uint16)
     return tokens_np_uint16
 
