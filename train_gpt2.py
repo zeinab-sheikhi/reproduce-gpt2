@@ -5,7 +5,6 @@ import time
 from dataclasses import dataclass
 
 import numpy as np
-import tiktoken
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -105,10 +104,10 @@ class GPT(nn.Module):
         self.config = config
         self.transformer = nn.ModuleDict(
             dict(
-                wte = nn.Embedding(self.config.vocab_size, self.config.n_emb),
-                wpe = nn.Embedding(self.config.block_size, self.config.n_emb),
-                h = nn.ModuleList([Block(self.config) for _ in range(self.config.n_layer)]),
-                ln_f = nn.LayerNorm(self.config.n_emb)
+                wte=nn.Embedding(self.config.vocab_size, self.config.n_emb),
+                wpe=nn.Embedding(self.config.block_size, self.config.n_emb),
+                h=nn.ModuleList([Block(self.config) for _ in range(self.config.n_layer)]),
+                ln_f=nn.LayerNorm(self.config.n_emb)
             )
         )
         self.lm_head = nn.Linear(self.config.n_emb, self.config.vocab_size, bias=False)
@@ -235,12 +234,6 @@ class GPT(nn.Module):
         return optimizer
         
 
-def load_tokens(filename):
-    npt = np.load(filename)
-    ptt = torch.tensor(npt, dtype=torch.long)
-    return ptt
-
-
 # We want each process to get its own chunk of data to avoid each of them running the same data
 class DataLoaderLite:
     def __init__(self, B, T, process_rank, num_processes, split):
@@ -326,7 +319,7 @@ total_batch_size = 524288  # 2 ^ 19~0.5M tokens
 B = 16  # micro batch size 
 T = 1024  # sequence length 
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total batch size is divisible by (B*T*ddp_world_size)"
-grad_accum_steps =  total_batch_size // (B * T * ddp_world_size)  # we will have a single update after this number of steps
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)  # we will have a single update after this number of steps
 if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
