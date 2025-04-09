@@ -28,7 +28,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.ruff]
-select = [
+lint.select = [
  # pycodestyle
  "E",
  # Pyflakes
@@ -42,9 +42,9 @@ select = [
  # isort
  "I",
 ]
-ignore = []
+lint.ignore = []
 line-length = 120
-fixable = ["ALL"]                # Allow automatic fixes for all fixable issues
+lint.fixable = ["ALL"]                # Allow automatic fixes for all fixable issues
 
 [tool.ruff.lint.isort]
 force-single-line = true         # One import per line
